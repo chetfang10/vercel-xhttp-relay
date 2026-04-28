@@ -1,62 +1,50 @@
-export const config = { runtime: "edge" };
+// api/index.js  –  Node.js serverless runtime (replaces Edge runtime)
 
-const TARGET_BASE = (process.env.TARGET_DOMAIN || "").replace(/\/$/, "");
+const http  = require("http");
+const https = require("https");
 
-const STRIP_HEADERS = new Set([
-  "host",
-  "connection",
-  "keep-alive",
-  "proxy-authenticate",
-  "proxy-authorization",
-  "te",
-  "trailer",
-  "transfer-encoding",
-  "upgrade",
-  "forwarded",
-  "x-forwarded-host",
-  "x-forwarded-proto",
-  "x-forwarded-port",
+const HOP_BY_HOP = new Set([
+  "connection", "keep-alive", "transfer-encoding", "te",
+  "trailer", "upgrade", "proxy-authorization", "proxy-authenticate",
 ]);
 
-export default async function handler(req) {
-  if (!TARGET_BASE) {
-    return new Response("Misconfigured: TARGET_DOMAIN is not set", { status: 500 });
+const TARGET = (process.env.TARGET_DOMAIN || "").replace(/\/+$/, "");
+const targetUrl = new URL(TARGET);
+const client = targetUrl.protocol === "https:" ? https : http;
+
+module.exports = function handler(req, res) {
+  const path = req.url.slice(req.url.indexOf("/", 8) === -1
+    ? req.url.length
+    : req.url.indexOf("/", 8)) || "/";
+
+  const forwardHeaders = {};
+  for (const [k, v] of Object.entries(req.headers)) {
+    const lk = k.toLowerCase();
+    if (HOP_BY_HOP.has(lk)) continue;
+    if (lk.startsWith("x-vercel-")) continue;
+    if (lk === "x-forwarded-host" || lk === "x-forwarded-proto" || lk === "x-forwarded-port") continue;
+    forwardHeaders[k] = v;
   }
+  forwardHeaders["x-forwarded-for"] =
+    req.headers["x-real-ip"] || req.headers["x-forwarded-for"] || "";
 
-  try {
-    const pathStart = req.url.indexOf("/", 8);
-    const targetUrl =
-      pathStart === -1 ? TARGET_BASE + "/" : TARGET_BASE + req.url.slice(pathStart);
+  const options = {
+    hostname: targetUrl.hostname,
+    port:     targetUrl.port || (targetUrl.protocol === "https:" ? 443 : 80),
+    path:     path,
+    method:   req.method,
+    headers:  forwardHeaders,
+  };
 
-    const out = new Headers();
-    let clientIp = null;
-    for (const [k, v] of req.headers) {
-      if (STRIP_HEADERS.has(k)) continue;
-      if (k.startsWith("x-vercel-")) continue;
-      if (k === "x-real-ip") {
-        clientIp = v;
-        continue;
-      }
-      if (k === "x-forwarded-for") {
-        if (!clientIp) clientIp = v;
-        continue;
-      }
-      out.set(k, v);
-    }
-    if (clientIp) out.set("x-forwarded-for", clientIp);
+  const proxy = client.request(options, (upstream) => {
+    res.writeHead(upstream.statusCode, upstream.headers);
+    upstream.pipe(res);
+  });
 
-    const method = req.method;
-    const hasBody = method !== "GET" && method !== "HEAD";
+  proxy.on("error", (err) => {
+    res.writeHead(502);
+    res.end("Bad Gateway");
+  });
 
-    return await fetch(targetUrl, {
-      method,
-      headers: out,
-      body: hasBody ? req.body : undefined,
-      duplex: "half",
-      redirect: "manual",
-    });
-  } catch (err) {
-    console.error("relay error:", err);
-    return new Response("Bad Gateway: Tunnel Failed", { status: 502 });
-  }
-}
+  req.pipe(proxy);
+};
